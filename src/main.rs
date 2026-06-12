@@ -1,875 +1,627 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Stream, StreamConfig};
-use rustfft::{num_complex::Complex, FftPlanner};
-use std::collections::VecDeque;
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
-
 // ============================================================
-// 处理模式配置
+// VocalSieve - 实时人声筛选器 · 主程序入口与GUI
 // ============================================================
-
-#[derive(Clone, Copy, Debug)]
-enum ProcessingMode {
-    Performance,
-    Balanced,
-    Deep,
-}
-
-impl ProcessingMode {
-    fn frame_duration_ms(&self) -> f32 {
-        match self {
-            Self::Performance => 16.0,
-            Self::Balanced => 32.0,
-            Self::Deep => 46.0,
-        }
-    }
-
-    fn overlap_ratio(&self) -> f32 {
-        match self {
-            Self::Performance => 0.0,
-            Self::Balanced => 0.5,
-            Self::Deep => 0.875,
-        }
-    }
-
-    fn similarity_threshold(&self) -> f32 {
-        match self {
-            Self::Performance => 0.70,
-            Self::Balanced => 0.65,
-            Self::Deep => 0.55,
-        }
-    }
-
-    fn suppress_gain(&self) -> f32 {
-        match self {
-            Self::Performance => 0.0,
-            Self::Balanced => 0.0,
-            Self::Deep => 0.0,
-        }
-    }
-
-    fn enhance_gain(&self) -> f32 {
-        match self {
-            Self::Performance => 2.5,
-            Self::Balanced => 2.0,
-            Self::Deep => 3.0,
-        }
-    }
-
-    fn smoothing_coeff(&self) -> f32 {
-        match self {
-            Self::Performance => 0.70,
-            Self::Balanced => 0.60,
-            Self::Deep => 0.80,
-        }
-    }
-
-    fn temporal_smooth_frames(&self) -> usize {
-        match self {
-            Self::Performance => 1,
-            Self::Balanced => 3,
-            Self::Deep => 5,
-        }
-    }
-
-    fn max_targets(&self) -> usize {
-        match self {
-            Self::Performance => 1,
-            Self::Balanced => usize::MAX,
-            Self::Deep => usize::MAX,
-        }
-    }
-
-    fn uses_fft(&self) -> bool {
-        !matches!(self, Self::Performance)
-    }
-
-    fn uses_window(&self) -> bool {
-        matches!(self, Self::Deep)
-    }
-
-    fn uses_overlap(&self) -> bool {
-        !matches!(self, Self::Performance)
-    }
-}
-
-// ============================================================
-// 目标人声
+// 本文件实现：
+//   - eframe/egui GUI主窗口
+//   - 应用状态管理（空闲/录音/运行）
+//   - 音频设备选择与刷新
+//   - 处理模式切换
+//   - 目标人声管理（添加/删除/持久化）
+//   - 虚拟音频线缆检测与配置
+//   - 实时状态显示（相似度、增益）
+//   - 中文字体加载
 // ============================================================
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum TargetAction {
-    Suppress,
-    Enhance,
-}
+mod audio;
 
-struct TargetVoice {
-    name: String,
-    action: TargetAction,
-    reference_features: Vec<Vec<f32>>,
-}
-
-// ============================================================
-// 特征提取
-// ============================================================
-
-/// 4 子带能量比特征（性能模式）
-fn extract_subband_energy(frame: &[f32]) -> Vec<f32> {
-    let n = frame.len();
-    let band1_end = n / 4;
-    let band2_end = n / 2;
-    let band3_end = 3 * n / 4;
-
-    let e1: f32 = frame[..band1_end].iter().map(|&x| x * x).sum();
-    let e2: f32 = frame[band1_end..band2_end].iter().map(|&x| x * x).sum();
-    let e3: f32 = frame[band2_end..band3_end].iter().map(|&x| x * x).sum();
-    let e4: f32 = frame[band3_end..].iter().map(|&x| x * x).sum();
-
-    let total = e1 + e2 + e3 + e4;
-    if total < 1e-10 {
-        return vec![0.25, 0.25, 0.25, 0.25];
-    }
-    vec![e1 / total, e2 / total, e3 / total, e4 / total]
-}
-
-/// FFT 幅度谱特征 → 梅尔频段降维（平衡/深度模式）
-fn extract_mel_spectrum(frame: &[f32], planner: &mut FftPlanner<f32>, sample_rate: u32, n_mels: usize) -> Vec<f32> {
-    let n = frame.len();
-    let fft = planner.plan_fft_forward(n);
-    let mut buffer: Vec<Complex<f32>> = frame
-        .iter()
-        .map(|&x| Complex::new(x, 0.0))
-        .collect();
-    fft.process(&mut buffer);
-
-    let spectrum_len = n / 2 + 1;
-    let power: Vec<f32> = buffer[..spectrum_len]
-        .iter()
-        .map(|c| c.norm_sqr() / (n as f32))
-        .collect();
-
-    // 梅尔频段滤波器组
-    let mel_low = hz_to_mel(80.0);
-    let mel_high = hz_to_mel(sample_rate as f32 / 2.0);
-    let mel_points: Vec<f32> = (0..=n_mels + 1)
-        .map(|i| mel_low + (mel_high - mel_low) * i as f32 / (n_mels + 1) as f32)
-        .collect();
-    let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
-    let bin_points: Vec<f32> = hz_points
-        .iter()
-        .map(|&hz| (hz / sample_rate as f32) * (n as f32))
-        .collect();
-
-    let mut mel_energies = vec![0.0f32; n_mels];
-    for i in 0..n_mels {
-        let left = bin_points[i] as usize;
-        let center = bin_points[i + 1] as usize;
-        let right = bin_points[i + 2] as usize;
-        let left = left.max(1);
-        let right = right.min(spectrum_len - 1);
-        let center = center.max(left).min(right);
-
-        let mut energy = 0.0f32;
-        for k in left..=right {
-            let weight = if k <= center && center > left {
-                (k - left) as f32 / (center - left) as f32
-            } else if k > center && right > center {
-                (right - k) as f32 / (right - center) as f32
-            } else {
-                1.0
-            };
-            energy += power[k] * weight;
-        }
-        mel_energies[i] = energy.max(1e-10).ln(); // log 压缩
-    }
-
-    // L2 归一化
-    let norm: f32 = mel_energies.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm < 1e-10 {
-        return vec![0.0; n_mels];
-    }
-    mel_energies.iter().map(|&x| x / norm).collect()
-}
-
-fn hz_to_mel(hz: f32) -> f32 {
-    2595.0 * (1.0 + hz / 700.0).ln() / std::f32::consts::LN_10
-}
-
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
-}
-
-/// 余弦相似度
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a < 1e-10 || norm_b < 1e-10 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
-}
-
-/// 计算帧与参考特征的最大相似度
-fn compute_max_similarity(frame_features: &[f32], reference: &[Vec<f32>]) -> f32 {
-    reference
-        .iter()
-        .map(|ref_feat| cosine_similarity(frame_features, ref_feat))
-        .fold(0.0f32, f32::max)
-}
+use audio::{
+    find_input_device, find_output_device, list_input_devices, list_output_devices,
+    load_targets, record_reference, save_targets, build_reference_features,
+    AudioSession, ProcessingMode, TargetAction, TargetVoice,
+    detect_virtual_cable_output, find_virtual_cable_output_index,
+};
+use cpal::traits::DeviceTrait;
+use eframe::egui;
 
 // ============================================================
-// 汉宁窗
+// 应用状态
 // ============================================================
 
-fn hanning_window(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()))
-        .collect()
+/// 应用状态枚举，表示当前所处的阶段
+enum AppState {
+    /// 空闲状态：未在录音或处理
+    Idle,
+    /// 录音状态：正在录制参考声音
+    /// countdown: 倒计时计数器（每100ms减1，50次=5秒）
+    /// target_name: 目标人声名称
+    /// target_action: 对目标执行的动作（消除/增强）
+    Recording { countdown: u32, target_name: String, target_action: TargetAction },
+    /// 运行状态：实时音频处理已启动
+    Running,
 }
 
-// ============================================================
-// 音频处理器
-// ============================================================
+/// 主应用结构体，持有所有GUI状态和音频会话
+struct VocalSieveApp {
+    // --- 设备相关 ---
+    /// 可用的输入设备名称列表
+    input_devices: Vec<String>,
+    /// 可用的输出设备名称列表
+    output_devices: Vec<String>,
+    /// 当前选中的输入设备索引
+    selected_input: usize,
+    /// 当前选中的输出设备索引
+    selected_output: usize,
 
-struct AudioProcessor {
-    mode: ProcessingMode,
+    // --- 模式相关 ---
+    /// 当前选中的处理模式索引（对应 ProcessingMode::all()）
+    selected_mode: usize,
+
+    // --- 目标人声相关 ---
+    /// 已添加的目标人声列表
     targets: Vec<TargetVoice>,
-    // 帧参数
-    frame_size: usize,
-    hop_size: usize,
-    sample_rate: u32,
-    n_mels: usize,
-    // 缓冲区
-    input_buffer: Vec<f32>,
-    overlap_buffer: Vec<f32>,
-    // 增益平滑
-    current_gain: f32,
-    // 消除保持
-    suppress_hold_frames: usize,
-    suppress_hold_counter: usize,
-    // 时间平滑
-    similarity_history: Vec<Vec<f32>>,
-    // FFT planner
-    fft_planner: FftPlanner<f32>,
-    // 窗函数
-    window: Vec<f32>,
-    // 统计
-    frames_processed: u64,
-    // 调试
-    debug_counter: u64,
+    /// 新目标名称的输入框内容
+    new_target_name: String,
+    /// 新目标动作选择：0=消除，1=增强
+    new_target_action: usize,
+
+    // --- 运行状态 ---
+    /// 当前应用状态
+    state: AppState,
+    /// 活跃的音频会话（包含输入/输出流和处理器）
+    session: Option<AudioSession>,
+
+    // --- 录音线程 ---
+    /// 录音线程的JoinHandle，用于检测录音是否完成并获取结果
+    /// 线程返回 Result<Vec<Vec<f32>>, String>：成功返回特征向量集合，失败返回错误信息
+    recording_handle: Option<std::thread::JoinHandle<Result<Vec<Vec<f32>>, String>>>,
+
+    // --- 状态信息 ---
+    /// 底部状态栏显示的消息
+    status_msg: String,
+
+    // --- 实时监控数据 ---
+    /// 各目标人声的最新相似度值（从处理器读取）
+    live_similarities: Vec<f32>,
+    /// 当前应用的增益值（从处理器读取）
+    live_gain: f32,
 }
 
-impl AudioProcessor {
-    fn new(mode: ProcessingMode, targets: Vec<TargetVoice>, actual_sample_rate: u32) -> Self {
-        // 根据目标时间帧长计算实际帧长（不强制2的幂）
-        let frame_size = (actual_sample_rate as f64 * mode.frame_duration_ms() as f64 / 1000.0).round() as usize;
-        let frame_size = frame_size.max(64); // 最小64样本
-        let hop_size = (frame_size as f32 * (1.0 - mode.overlap_ratio())) as usize;
-        let hop_size = hop_size.max(1);
+impl VocalSieveApp {
+    /// 创建应用实例，初始化设备列表和已保存的目标
+    fn new() -> Self {
+        // 枚举系统中的音频设备
+        let input_devices = list_input_devices();
+        let output_devices = list_output_devices();
+        // 从磁盘加载之前保存的目标人声
+        let targets = load_targets().unwrap_or_default();
 
-        let window = if mode.uses_window() {
-            hanning_window(frame_size)
-        } else {
-            vec![1.0; frame_size]
-        };
-
-        let overlap_len = frame_size - hop_size;
-        let overlap_buffer = if mode.uses_overlap() {
-            vec![0.0; overlap_len]
-        } else {
-            vec![]
-        };
-
-        let temporal_frames = mode.temporal_smooth_frames();
-        let num_targets = targets.len();
-        let similarity_history = vec![vec![0.0; num_targets]; temporal_frames];
-
-        AudioProcessor {
-            mode,
+        VocalSieveApp {
+            // 默认选择第一个输入设备
+            selected_input: 0,
+            // 如果有多个输出设备，默认选第二个（通常是虚拟线缆或非默认扬声器）
+            selected_output: if output_devices.len() > 1 { 1 } else { 0 },
+            // 默认选择平衡模式（索引1）
+            selected_mode: 1,
+            input_devices,
+            output_devices,
             targets,
-            frame_size,
-            hop_size,
-            sample_rate: actual_sample_rate,
-            n_mels: 32,
-            input_buffer: Vec::with_capacity(frame_size * 2),
-            overlap_buffer,
-            current_gain: 1.0,
-            suppress_hold_frames: 3,
-            suppress_hold_counter: 0,
-            similarity_history,
-            fft_planner: FftPlanner::new(),
-            window,
-            frames_processed: 0,
-            debug_counter: 0,
+            new_target_name: String::new(),
+            new_target_action: 0,
+            state: AppState::Idle,
+            session: None,
+            recording_handle: None,
+            status_msg: String::new(),
+            live_similarities: Vec::new(),
+            live_gain: 1.0,
         }
     }
 
-    /// 计算帧的RMS能量
-    fn frame_rms(frame: &[f32]) -> f32 {
-        let sum: f32 = frame.iter().map(|&x| x * x).sum();
-        (sum / frame.len() as f32).sqrt()
+    /// 根据当前选中的模式索引获取 ProcessingMode 枚举值
+    fn current_mode(&self) -> ProcessingMode {
+        ProcessingMode::all()[self.selected_mode]
     }
 
-    /// 提取当前帧的特征
-    fn extract_features(&mut self, frame: &[f32]) -> Vec<f32> {
-        if self.mode.uses_fft() {
-            let windowed: Vec<f32> = frame
-                .iter()
-                .zip(self.window.iter())
-                .map(|(&s, &w)| s * w)
-                .collect();
-            extract_mel_spectrum(&windowed, &mut self.fft_planner, self.sample_rate, self.n_mels)
+    /// 刷新音频设备列表，并修正越界的选中索引
+    fn refresh_devices(&mut self) {
+        self.input_devices = list_input_devices();
+        self.output_devices = list_output_devices();
+        // 防止选中索引超出新列表范围
+        if self.selected_input >= self.input_devices.len() {
+            self.selected_input = 0;
+        }
+        if self.selected_output >= self.output_devices.len() {
+            self.selected_output = 0;
+        }
+    }
+
+    /// 开始录制参考声音
+    /// 在新线程中执行5秒录音，录音完成后自动提取特征并添加到目标列表
+    fn start_recording(&mut self) {
+        let input_name = self.input_devices.get(self.selected_input).cloned();
+        let mode = self.current_mode();
+        let name = self.new_target_name.clone();
+        let action = if self.new_target_action == 0 {
+            TargetAction::Suppress
         } else {
-            extract_subband_energy(frame)
-        }
-    }
+            TargetAction::Enhance
+        };
 
-    /// 计算每个目标的平滑相似度
-    fn compute_smoothed_similarities(&mut self, frame_features: &[f32]) -> Vec<f32> {
-        let n_targets = self.targets.len();
-        let mut current_sims = Vec::with_capacity(n_targets);
-
-        for target in &self.targets {
-            let sim = compute_max_similarity(frame_features, &target.reference_features);
-            current_sims.push(sim);
-        }
-
-        // 更新历史
-        self.similarity_history.pop();
-        self.similarity_history.insert(0, current_sims.clone());
-
-        // 时间平滑：取最近几帧的最大值
-        let temporal_frames = self.mode.temporal_smooth_frames();
-        let mut smoothed = vec![0.0f32; n_targets];
-        for t in 0..n_targets {
-            let mut max_sim = 0.0f32;
-            let count = self.similarity_history.len().min(temporal_frames);
-            for h in 0..count {
-                max_sim = max_sim.max(self.similarity_history[h][t]);
-            }
-            smoothed[t] = max_sim;
-        }
-
-        smoothed
-    }
-
-    /// 决定增益
-    fn decide_gain(&mut self, similarities: &[f32]) -> f32 {
-        let threshold = self.mode.similarity_threshold();
-
-        // 优先检查消除目标
-        for (i, target) in self.targets.iter().enumerate() {
-            if target.action == TargetAction::Suppress && similarities[i] >= threshold {
-                self.suppress_hold_counter = self.suppress_hold_frames;
-                return self.mode.suppress_gain();
-            }
-        }
-
-        // 消除保持：即使当前帧未匹配，也保持消除若干帧
-        if self.suppress_hold_counter > 0 {
-            self.suppress_hold_counter -= 1;
-            return self.mode.suppress_gain();
-        }
-
-        // 再检查增强目标
-        for (i, target) in self.targets.iter().enumerate() {
-            if target.action == TargetAction::Enhance && similarities[i] >= threshold {
-                return self.mode.enhance_gain();
-            }
-        }
-
-        1.0
-    }
-
-    /// 处理一帧音频
-    fn process_frame(&mut self, frame: &mut [f32]) {
-        debug_assert_eq!(frame.len(), self.frame_size);
-
-        // 噪声门限：静音帧直接跳过处理
-        let rms = Self::frame_rms(frame);
-        if rms < 0.001 {
-            // 静音帧：重置增益到1.0，输出静音
-            self.current_gain = 1.0;
-            self.suppress_hold_counter = 0;
-            self.frames_processed += 1;
+        // 验证：名称不能为空
+        if name.is_empty() {
+            self.status_msg = "请输入目标名称".into();
             return;
         }
 
-        // 提取特征
-        let features = self.extract_features(frame);
-
-        // 计算平滑相似度
-        let similarities = self.compute_smoothed_similarities(&features);
-
-        // 决定目标增益
-        let target_gain = self.decide_gain(&similarities);
-
-        // 增益平滑（一阶低通滤波）
-        let alpha = self.mode.smoothing_coeff();
-        self.current_gain = alpha * self.current_gain + (1.0 - alpha) * target_gain;
-
-        // 每100帧打印调试信息
-        self.debug_counter += 1;
-        if self.debug_counter % 100 == 0 {
-            eprint!("\r[调试] 相似度: ");
-            for (i, t) in self.targets.iter().enumerate() {
-                eprint!("{}={:.3} ", t.name, similarities[i]);
-            }
-            eprint!("| 增益: {:.3} ", self.current_gain);
+        // 验证：检查当前模式的消除目标数量限制
+        let max = mode.max_targets();
+        let current_suppress = self.targets.iter().filter(|t| t.action == TargetAction::Suppress).count();
+        let _current_enhance = self.targets.iter().filter(|t| t.action == TargetAction::Enhance).count();
+        if action == TargetAction::Suppress && current_suppress >= max {
+            self.status_msg = format!("该模式最多支持 {} 个消除目标", max);
+            return;
         }
 
-        // 应用增益
-        for sample in frame.iter_mut() {
-            *sample *= self.current_gain;
-        }
+        if let Some(input_name) = input_name {
+            self.status_msg = "正在录音... 请说话（5秒）".into();
+            // 切换到录音状态，启动倒计时
+            self.state = AppState::Recording {
+                countdown: 50, // 50 × 100ms = 5秒
+                target_name: name,
+                target_action: action,
+            };
 
-        self.frames_processed += 1;
+            // 在新线程中执行录音和特征提取，避免阻塞GUI
+            let handle = std::thread::spawn(move || {
+                // 查找输入设备
+                let device = find_input_device(&input_name)
+                    .ok_or("找不到输入设备")?;
+                // 获取设备默认配置
+                let config = device.default_input_config()
+                    .map_err(|e| format!("配置错误: {}", e))?;
+                let stream_config: cpal::StreamConfig = config.into();
+                // 录制5秒参考音频
+                let audio = record_reference(&device, &stream_config, 5)?;
+                // 从参考音频中提取特征向量集合
+                let features = build_reference_features(&audio, mode, stream_config.sample_rate.0);
+                Ok(features)
+            });
+            self.recording_handle = Some(handle);
+        }
     }
 
-    /// 处理输入样本流，返回输出样本
-    fn process_samples(&mut self, input: &[f32]) -> Vec<f32> {
-        let frame_size = self.frame_size;
-        let hop_size = self.hop_size;
+    /// 启动实时音频处理
+    /// 根据当前选择的设备、模式和目标创建 AudioSession
+    fn start_processing(&mut self) {
+        // 验证：至少需要一个目标
+        if self.targets.is_empty() {
+            self.status_msg = "请先添加至少一个目标".into();
+            return;
+        }
 
-        self.input_buffer.extend_from_slice(input);
+        let input_name = self.input_devices.get(self.selected_input).cloned();
+        let output_name = self.output_devices.get(self.selected_output).cloned();
+        let mode = self.current_mode();
+        let targets = self.targets.clone();
 
-        let mut output = Vec::new();
+        if let (Some(input_name), Some(output_name)) = (input_name, output_name) {
+            // 查找输入和输出设备
+            match (
+                find_input_device(&input_name),
+                find_output_device(&output_name),
+            ) {
+                (Some(input_dev), Some(output_dev)) => {
+                    // 创建并启动音频会话
+                    match AudioSession::start(&input_dev, &output_dev, mode, targets) {
+                        Ok(session) => {
+                            self.session = Some(session);
+                            self.state = AppState::Running;
+                            self.status_msg = "实时处理已启动".into();
+                        }
+                        Err(e) => {
+                            self.status_msg = format!("启动失败: {}", e);
+                        }
+                    }
+                }
+                _ => {
+                    self.status_msg = "找不到所选设备".into();
+                }
+            }
+        }
+    }
 
-        while self.input_buffer.len() >= frame_size {
-            let mut frame: Vec<f32> = self.input_buffer[..frame_size].to_vec();
-            self.input_buffer.drain(..hop_size);
+    /// 停止实时音频处理
+    /// 停止音频流并重置状态
+    fn stop_processing(&mut self) {
+        // 停止并丢弃音频会话（Drop时会自动停止流）
+        if let Some(session) = self.session.take() {
+            session.stop();
+        }
+        self.state = AppState::Idle;
+        self.status_msg = "已停止".into();
+        // 清空实时监控数据
+        self.live_similarities.clear();
+        self.live_gain = 1.0;
+    }
+}
 
-            self.process_frame(&mut frame);
+// ============================================================
+// eframe GUI 实现
+// ============================================================
 
-            if self.mode.uses_overlap() {
-                let overlap_len = self.overlap_buffer.len();
+impl eframe::App for VocalSieveApp {
+    /// 每帧调用一次，更新应用状态并绘制GUI
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- 检查录音线程是否完成 ---
+        // 使用 take() 取出 JoinHandle，如果线程未完成则放回
+        if let Some(handle) = self.recording_handle.take() {
+            if !handle.is_finished() {
+                // 线程仍在运行，放回等待下次检查
+                self.recording_handle = Some(handle);
+            } else {
+                // 线程已完成，获取录音结果
+                match handle.join() {
+                    Ok(Ok(features)) => {
+                        // 录音成功，从当前状态获取目标信息
+                        let (name, action) = match &self.state {
+                            AppState::Recording { target_name, target_action, .. } => {
+                                (target_name.clone(), *target_action)
+                            }
+                            _ => (String::new(), TargetAction::Suppress),
+                        };
+                        if !name.is_empty() {
+                            // 创建新目标并添加到列表
+                            self.targets.push(TargetVoice {
+                                name,
+                                action,
+                                reference_features: features,
+                            });
+                            // 持久化保存到磁盘
+                            let _ = save_targets(&self.targets);
+                            self.status_msg = format!("已添加目标，共 {} 个", self.targets.len());
+                        }
+                        self.state = AppState::Idle;
+                    }
+                    Ok(Err(e)) => {
+                        // 录音过程中出错
+                        self.status_msg = format!("录音失败: {}", e);
+                        self.state = AppState::Idle;
+                    }
+                    Err(_) => {
+                        // 录音线程panic
+                        self.status_msg = "录音线程异常".into();
+                        self.state = AppState::Idle;
+                    }
+                }
+            }
+        }
 
-                for i in 0..overlap_len {
-                    frame[i] += self.overlap_buffer[i];
+        // --- 更新录音倒计时 ---
+        if let AppState::Recording { countdown, .. } = &mut self.state {
+            // 每帧减少1（约100ms一帧）
+            *countdown = countdown.saturating_sub(1);
+            // 倒计时结束且录音线程已返回结果
+            if *countdown == 0 && self.recording_handle.is_none() {
+                self.state = AppState::Idle;
+            }
+        }
+
+        // --- 更新实时监控数据 ---
+        // 从音频处理器中读取最新的相似度和增益值
+        if let Some(session) = &self.session {
+            if let Ok(proc) = session.processor.lock() {
+                self.live_similarities = proc.last_similarities.clone();
+                self.live_gain = proc.last_gain;
+            }
+        }
+
+        // 持续请求重绘，确保UI实时更新
+        ctx.request_repaint();
+
+        // --- 绘制主界面 ---
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // 标题
+            ui.vertical_centered(|ui| {
+                ui.add_space(8.0);
+                ui.heading("VocalSieve - 实时人声筛选器");
+                ui.add_space(4.0);
+            });
+
+            ui.separator();
+
+            // === 设备选择面板 ===
+            ui.collapsing("音频设备", |ui| {
+                // 输入设备下拉框
+                ui.horizontal(|ui| {
+                    ui.label("输入设备:");
+                    egui::ComboBox::from_id_salt("input_device")
+                        .selected_text(
+                            self.input_devices
+                                .get(self.selected_input)
+                                .map(|s| s.as_str())
+                                .unwrap_or("(无)"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (i, name) in self.input_devices.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_input, i, name);
+                            }
+                        });
+                });
+
+                // 输出设备下拉框
+                ui.horizontal(|ui| {
+                    ui.label("输出设备:");
+                    egui::ComboBox::from_id_salt("output_device")
+                        .selected_text(
+                            self.output_devices
+                                .get(self.selected_output)
+                                .map(|s| s.as_str())
+                                .unwrap_or("(无)"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (i, name) in self.output_devices.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_output, i, name);
+                            }
+                        });
+                });
+
+                // 刷新设备列表按钮
+                ui.horizontal(|ui| {
+                    if ui.button("刷新设备列表").clicked() {
+                        self.refresh_devices();
+                    }
+                });
+
+                ui.separator();
+
+                // === 虚拟音频线缆配置 ===
+                // 检测系统中是否安装了虚拟音频线缆（如VB-Cable），
+                // 用于将处理后的音频输出到游戏中
+                ui.label(egui::RichText::new("游戏输出配置").strong());
+                ui.add_space(4.0);
+
+                let cable_output = detect_virtual_cable_output();
+                if let Some(cable_name) = &cable_output {
+                    // 已检测到虚拟线缆：显示配置引导
+                    ui.colored_label(egui::Color32::GREEN, format!("已检测到虚拟线缆: {}", cable_name));
+
+                    // 一键将输出设备切换为虚拟线缆
+                    ui.horizontal(|ui| {
+                        if ui.button("一键配置为输出设备").clicked() {
+                            if let Some(idx) = find_virtual_cable_output_index(&self.output_devices) {
+                                self.selected_output = idx;
+                                self.status_msg = format!("已将输出设备切换为: {}", cable_name);
+                            }
+                        }
+                    });
+
+                    // 使用说明
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("使用方法:")
+                            .small()
+                            .color(egui::Color32::YELLOW),
+                    );
+                    ui.label(
+                        egui::RichText::new("1. 点击上方按钮将输出设为虚拟线缆")
+                            .small(),
+                    );
+                    ui.label(
+                        egui::RichText::new("2. 在游戏中将麦克风/输入设备选为虚拟线缆")
+                            .small(),
+                    );
+                    ui.label(
+                        egui::RichText::new("3. 点击「开始实时处理」即可")
+                            .small(),
+                    );
+                } else {
+                    // 未检测到虚拟线缆：提供下载引导
+                    ui.colored_label(egui::Color32::from_rgb(255, 150, 50), "未检测到虚拟音频线缆");
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("要让游戏使用本软件的输出，需要安装虚拟音频线缆:")
+                            .small()
+                            .color(egui::Color32::YELLOW),
+                    );
+                    ui.label(
+                        egui::RichText::new("推荐: VB-Cable (免费)")
+                            .small(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("打开 VB-Cable 下载页").clicked() {
+                            let _ = open::that("https://vb-audio.com/Cable/index.htm");
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("安装后重启本软件即可自动检测")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+            });
+
+            // === 处理模式面板 ===
+            ui.collapsing("处理模式", |ui| {
+                // 单选按钮组：性能/平衡/深度
+                for (i, mode) in ProcessingMode::all().iter().enumerate() {
+                    ui.radio_value(&mut self.selected_mode, i, mode.label());
+                }
+                // 显示当前模式的参数摘要
+                let mode = self.current_mode();
+                ui.label(format!(
+                    "阈值: {:.2} | 消除增益: {:.2} | 增强增益: {:.1}x",
+                    mode.similarity_threshold(),
+                    mode.suppress_gain(),
+                    mode.enhance_gain(),
+                ));
+            });
+
+            // === 目标人声管理面板 ===
+            ui.collapsing("目标人声管理", |ui| {
+                // 已有目标列表
+                if !self.targets.is_empty() {
+                    ui.label(egui::RichText::new("已有目标:").strong());
+                    // 收集待删除目标的索引（不能在迭代中修改列表）
+                    let mut to_remove: Option<usize> = None;
+                    for (i, target) in self.targets.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            // 根据动作类型显示不同颜色的标签
+                            let action_label = match target.action {
+                                TargetAction::Suppress => "消除",
+                                TargetAction::Enhance => "增强",
+                            };
+                            let color = match target.action {
+                                TargetAction::Suppress => egui::Color32::RED,
+                                TargetAction::Enhance => egui::Color32::GREEN,
+                            };
+                            ui.colored_label(color, format!("{} [{}]", target.name, action_label));
+                            // 显示参考特征帧数
+                            ui.label(format!("({} 帧参考)", target.reference_features.len()));
+                            // 删除按钮
+                            if ui.small_button("删除").clicked() {
+                                to_remove = Some(i);
+                            }
+                        });
+                    }
+                    // 执行删除并保存
+                    if let Some(idx) = to_remove {
+                        self.targets.remove(idx);
+                        let _ = save_targets(&self.targets);
+                    }
+                    ui.separator();
                 }
 
-                self.overlap_buffer
-                    .copy_from_slice(&frame[hop_size..frame_size]);
+                // 添加新目标的表单
+                let is_recording = matches!(self.state, AppState::Recording { .. });
+                // 目标名称输入框（录音时禁用）
+                ui.add_enabled(!is_recording, egui::TextEdit::singleline(&mut self.new_target_name).hint_text("目标名称"));
+                // 动作选择：消除/增强
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.new_target_action, 0, "消除");
+                    ui.radio_value(&mut self.new_target_action, 1, "增强");
+                });
+                // 录音按钮（录音时禁用，并显示倒计时）
+                ui.add_enabled_ui(!is_recording, |ui| {
+                    let label = if is_recording {
+                        if let AppState::Recording { countdown, .. } = &self.state {
+                            format!("录音中... {}s", (countdown + 9) / 10)
+                        } else {
+                            "录音中...".into()
+                        }
+                    } else {
+                        "录制参考声音 (5秒)".into()
+                    };
+                    if ui.button(label).clicked() {
+                        self.start_recording();
+                    }
+                });
+            });
 
-                output.extend_from_slice(&frame[..hop_size]);
-            } else {
-                output.extend_from_slice(&frame);
+            ui.separator();
+
+            // === 启动/停止按钮 ===
+            ui.horizontal(|ui| {
+                let is_running = matches!(self.state, AppState::Running);
+                if is_running {
+                    // 运行中：显示停止按钮
+                    if ui.button("停止处理").clicked() {
+                        self.stop_processing();
+                    }
+                } else {
+                    // 未运行：显示启动按钮（无目标时禁用）
+                    ui.add_enabled_ui(!self.targets.is_empty(), |ui| {
+                        if ui.button("开始实时处理").clicked() {
+                            self.start_processing();
+                        }
+                    });
+                }
+            });
+
+            // === 实时状态面板 ===
+            // 仅在运行状态下显示
+            if matches!(self.state, AppState::Running) {
+                ui.separator();
+                ui.label(egui::RichText::new("实时状态").strong());
+
+                // 增益指示器：根据增益值显示不同颜色
+                // 红色=消除中（增益≈0），绿色=增强中（增益>1），白色=正常
+                let gain_color = if self.live_gain < 0.1 {
+                    egui::Color32::RED
+                } else if self.live_gain > 1.5 {
+                    egui::Color32::GREEN
+                } else {
+                    egui::Color32::WHITE
+                };
+                ui.colored_label(gain_color, format!("当前增益: {:.3}", self.live_gain));
+
+                // 各目标的相似度显示
+                for (i, target) in self.targets.iter().enumerate() {
+                    let sim = self.live_similarities.get(i).copied().unwrap_or(0.0);
+                    let threshold = self.current_mode().similarity_threshold();
+                    // 超过阈值显示红色（匹配中），未超过显示绿色（安全）
+                    let color = if sim >= threshold {
+                        egui::Color32::from_rgb(255, 100, 100)
+                    } else {
+                        egui::Color32::from_rgb(100, 200, 100)
+                    };
+                    ui.colored_label(color, format!("{}: 相似度 {:.3} (阈值 {:.2})", target.name, sim, threshold));
+
+                    // 相似度进度条，超过阈值时填充红色
+                    let progress = (sim / 1.0).clamp(0.0, 1.0);
+                    let mut bar = egui::ProgressBar::new(progress)
+                        .text(format!("{:.0}%", sim * 100.0));
+                    if sim >= threshold {
+                        bar = bar.fill(egui::Color32::RED);
+                    }
+                    ui.add(bar);
+                }
             }
-        }
 
-        output
-    }
-}
-
-// ============================================================
-// 参考录音
-// ============================================================
-
-fn record_reference(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    duration_secs: u64,
-) -> Result<Vec<f32>, String> {
-    let sample_rate = config.sample_rate.0;
-    let channels = config.channels as usize;
-    let total_samples = sample_rate as usize * channels * duration_secs as usize;
-
-    let recorded = Arc::new(Mutex::new(Vec::with_capacity(total_samples)));
-    let recorded_clone = recorded.clone();
-
-    let stream = device
-        .build_input_stream(
-            config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mut buf = recorded_clone.lock().unwrap();
-                buf.extend_from_slice(data);
-            },
-            |err| eprintln!("录音错误: {}", err),
-            None,
-        )
-        .map_err(|e| format!("无法创建录音流: {}", e))?;
-
-    stream.play().map_err(|e| format!("无法开始录音: {}", e))?;
-
-    println!("  录音中... 请说话（{}秒）", duration_secs);
-    std::thread::sleep(std::time::Duration::from_secs(duration_secs));
-
-    drop(stream);
-
-    let samples = Arc::try_unwrap(recorded).unwrap().into_inner().unwrap();
-
-    let mono = if channels > 1 {
-        samples.iter().step_by(channels).copied().collect()
-    } else {
-        samples
-    };
-
-    Ok(mono)
-}
-
-/// 从录音中提取参考特征
-fn build_reference_features(
-    audio: &[f32],
-    mode: ProcessingMode,
-    actual_sample_rate: u32,
-) -> Vec<Vec<f32>> {
-    let frame_size = (actual_sample_rate as f64 * mode.frame_duration_ms() as f64 / 1000.0).round() as usize;
-    let frame_size = frame_size.max(64);
-    let hop_size = frame_size;
-    let n_mels = 32;
-    let mut planner = FftPlanner::new();
-    let window = if mode.uses_window() {
-        hanning_window(frame_size)
-    } else {
-        vec![1.0; frame_size]
-    };
-
-    let mut features = Vec::new();
-    let mut pos = 0;
-
-    while pos + frame_size <= audio.len() {
-        let frame = &audio[pos..pos + frame_size];
-
-        // 跳过静音帧
-        let rms = (frame.iter().map(|&x| x * x).sum::<f32>() / frame.len() as f32).sqrt();
-        if rms < 0.001 {
-            pos += hop_size;
-            continue;
-        }
-
-        let feat = if mode.uses_fft() {
-            let windowed: Vec<f32> = frame
-                .iter()
-                .zip(window.iter())
-                .map(|(&s, &w)| s * w)
-                .collect();
-            extract_mel_spectrum(&windowed, &mut planner, actual_sample_rate, n_mels)
-        } else {
-            extract_subband_energy(frame)
-        };
-
-        features.push(feat);
-        pos += hop_size;
-    }
-
-    println!(
-        "  参考特征: {} 帧, 维度: {} (梅尔频段)",
-        features.len(),
-        features.first().map(|f| f.len()).unwrap_or(0)
-    );
-
-    // 限制参考特征数量
-    let max_features = 100;
-    if features.len() > max_features {
-        let step = features.len() as f32 / max_features as f32;
-        let sampled: Vec<Vec<f32>> = (0..max_features)
-            .map(|i| features[(i as f32 * step) as usize].clone())
-            .collect();
-        sampled
-    } else {
-        features
-    }
-}
-
-// ============================================================
-// 用户交互
-// ============================================================
-
-fn read_line(prompt: &str) -> String {
-    print!("{}", prompt);
-    io::stdout().flush().unwrap();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    input.trim().to_string()
-}
-
-fn select_processing_mode() -> ProcessingMode {
-    loop {
-        let choice = read_line(
-            "\n选择全局处理模式:\n  1) 性能模式 (低延迟, 低CPU, 单目标)\n  2) 平衡模式 (中等质量, 多目标)\n  3) 深度模式 (高质量, 多目标)\n请输入 (1/2/3): ",
-        );
-        match choice.as_str() {
-            "1" => {
-                println!("已选择: 性能模式");
-                return ProcessingMode::Performance;
+            // === 状态消息 ===
+            if !self.status_msg.is_empty() {
+                ui.separator();
+                ui.label(&self.status_msg);
             }
-            "2" => {
-                println!("已选择: 平衡模式");
-                return ProcessingMode::Balanced;
-            }
-            "3" => {
-                println!("已选择: 深度模式");
-                return ProcessingMode::Deep;
-            }
-            _ => println!("无效选择，请重新输入"),
-        }
-    }
-}
-
-fn select_target_action(name: &str) -> TargetAction {
-    loop {
-        let choice = read_line(&format!(
-            "  对 \"{}\" 的处理模式 - 消除(1) / 增强(2): ",
-            name
-        ));
-        match choice.as_str() {
-            "1" => {
-                println!("  → 将消除 \"{}\" 的人声", name);
-                return TargetAction::Suppress;
-            }
-            "2" => {
-                println!("  → 将增强 \"{}\" 的人声", name);
-                return TargetAction::Enhance;
-            }
-            _ => println!("  无效选择，请输入 1 或 2"),
-        }
-    }
-}
-
-// ============================================================
-// 主函数
-// ============================================================
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== VocalSieve - 实时人声筛选器 ===\n");
-
-    let mode = select_processing_mode();
-
-    let mut targets: Vec<TargetVoice> = Vec::new();
-
-    let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
-        .ok_or("未找到输入音频设备")?;
-    let output_device = host
-        .default_output_device()
-        .ok_or("未找到输出音频设备")?;
-
-    println!("\n输入设备: {}", input_device.name().unwrap_or_default());
-    println!("输出设备: {}", output_device.name().unwrap_or_default());
-
-    let default_input_config = input_device.default_input_config()?;
-    let default_output_config = output_device.default_output_config()?;
-
-    let input_sample_rate = default_input_config.sample_rate().0;
-    let output_sample_rate = default_output_config.sample_rate().0;
-
-    println!("输入采样率: {} Hz", input_sample_rate);
-    println!("输出采样率: {} Hz", output_sample_rate);
-
-    let input_config: StreamConfig = default_input_config.into();
-    let output_config: StreamConfig = default_output_config.into();
-
-    // 添加目标循环
-    loop {
-        let max = mode.max_targets();
-        if targets.len() >= max {
-            println!("\n已达到该模式下最大目标数量 ({})", max);
-            break;
-        }
-
-        if !targets.is_empty() {
-            println!("\n已添加 {} 个目标", targets.len());
-        }
-
-        let add_more = read_line("是否添加目标人声? (y/n): ");
-        if add_more.to_lowercase() != "y" {
-            break;
-        }
-
-        let name = read_line("  输入目标名称: ");
-        if name.is_empty() {
-            println!("  名称不能为空");
-            continue;
-        }
-
-        let action = select_target_action(&name);
-
-        println!("  准备录制参考声音...");
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let ref_audio = record_reference(&input_device, &input_config, 5)?;
-
-        if ref_audio.len() < 128 {
-            println!("  录音太短，请重试");
-            continue;
-        }
-
-        let features = build_reference_features(&ref_audio, mode, input_sample_rate);
-        println!(
-            "  已提取 {} 帧参考特征 (维度: {})",
-            features.len(),
-            features.first().map(|f| f.len()).unwrap_or(0)
-        );
-
-        targets.push(TargetVoice {
-            name,
-            action,
-            reference_features: features,
         });
     }
-
-    if targets.is_empty() {
-        println!("\n未添加任何目标，退出。");
-        return Ok(());
-    }
-
-    let processor = Arc::new(Mutex::new(AudioProcessor::new(mode, targets, output_sample_rate)));
-
-    let proc_frame_size = processor.lock().unwrap().frame_size;
-    let proc_hop_size = processor.lock().unwrap().hop_size;
-    println!("\n=== 配置摘要 ===");
-    println!("模式: {:?}", mode);
-    println!("输入采样率: {} Hz", input_sample_rate);
-    println!("输出采样率: {} Hz", output_sample_rate);
-    println!("帧长: {} 样本 ({:.1} ms)", proc_frame_size, proc_frame_size as f32 / output_sample_rate as f32 * 1000.0);
-    println!("帧移: {} 样本 ({:.1} ms)", proc_hop_size, proc_hop_size as f32 / output_sample_rate as f32 * 1000.0);
-    println!("目标数量: {}", processor.lock().unwrap().targets.len());
-    for t in &processor.lock().unwrap().targets {
-        println!(
-            "  - {} ({})",
-            t.name,
-            match t.action {
-                TargetAction::Suppress => "消除",
-                TargetAction::Enhance => "增强",
-            }
-        );
-    }
-    println!("================\n");
-
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
-
-    let processor_in = processor.clone();
-    let tx_in = tx.clone();
-    let input_stream = build_input_stream(&input_device, &input_config, processor_in, tx_in, output_sample_rate)?;
-
-    let output_stream = build_output_stream(&output_device, &output_config, rx)?;
-
-    input_stream.play()?;
-    output_stream.play()?;
-
-    println!("实时处理已启动，按 Ctrl+C 退出...");
-    println!("提示: 建议使用耳机避免扬声器反馈");
-
-    let running = Arc::new(Mutex::new(true));
-    let r = running.clone();
-    ctrlc_handler(r);
-
-    while *running.lock().unwrap() {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    println!("\n正在停止...");
-
-    drop(input_stream);
-    drop(output_stream);
-
-    let proc = processor.lock().unwrap();
-    println!("已处理 {} 帧", proc.frames_processed);
-    println!("VocalSieve 已退出。");
-
-    Ok(())
 }
 
-fn build_input_stream(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    processor: Arc<Mutex<AudioProcessor>>,
-    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
-    output_sample_rate: u32,
-) -> Result<Stream, Box<dyn std::error::Error>> {
-    let channels = config.channels as usize;
-    let input_sample_rate = config.sample_rate.0;
-    let need_resample = input_sample_rate != output_sample_rate;
-    let ratio = output_sample_rate as f64 / input_sample_rate as f64;
+// ============================================================
+// 程序入口
+// ============================================================
 
-    let stream = device.build_input_stream(
-        config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let mono: Vec<f32> = if channels > 1 {
-                data.chunks(channels).map(|ch| ch[0]).collect()
-            } else {
-                data.to_vec()
-            };
+/// 程序入口函数
+/// 配置窗口属性、加载中文字体、启动eframe事件循环
+fn main() -> eframe::Result<()> {
+    // 配置原生窗口选项
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([480.0, 640.0])       // 默认窗口大小
+            .with_min_inner_size([400.0, 500.0])    // 最小窗口大小
+            .with_title("VocalSieve"),               // 窗口标题
+        ..Default::default()
+    };
 
-            let samples = if need_resample {
-                let input_len = mono.len();
-                let output_len = (input_len as f64 * ratio) as usize;
-                let mut resampled = Vec::with_capacity(output_len);
-                for i in 0..output_len {
-                    let src_pos = i as f64 / ratio;
-                    let idx = src_pos as usize;
-                    let frac = src_pos - idx as f64;
-                    let s0 = mono.get(idx).copied().unwrap_or(0.0);
-                    let s1 = mono.get(idx + 1).copied().unwrap_or(0.0);
-                    resampled.push(s0 + (s1 - s0) * frac as f32);
-                }
-                resampled
-            } else {
-                mono
-            };
-
-            let mut proc = processor.lock().unwrap();
-            let output = proc.process_samples(&samples);
-
-            if !output.is_empty() {
-                // sync_channel 满时丢弃旧数据，避免延迟累积
-                let _ = tx.try_send(output);
+    // 启动eframe原生运行时
+    eframe::run_native(
+        "VocalSieve",
+        options,
+        Box::new(|cc| {
+            // 加载Windows系统中文字体（微软雅黑），解决中文显示为方框的问题
+            let mut fonts = egui::FontDefinitions::default();
+            if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") {
+                // 将字体数据注册到egui字体系统
+                fonts.font_data.insert(
+                    "msyh".into(),
+                    egui::FontData::from_owned(font_data),
+                );
+                // 将中文字体插入到 Proportional（比例字体）和 Monospace（等宽字体）族的首位
+                // 首位优先级最高，确保中文字符优先使用此字体渲染
+                fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "msyh".into());
+                fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "msyh".into());
             }
-        },
-        |err| eprintln!("输入流错误: {}", err),
-        None,
-    )?;
-
-    Ok(stream)
-}
-
-fn build_output_stream(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    rx: std::sync::mpsc::Receiver<Vec<f32>>,
-) -> Result<Stream, Box<dyn std::error::Error>> {
-    let channels = config.channels as usize;
-    let sample_rate = config.sample_rate.0;
-    // 限制输出缓冲区大小，防止延迟累积（最多100ms的数据）
-    let max_output_samples = sample_rate as usize * channels / 10;
-    let mut output_buffer: VecDeque<f32> = VecDeque::with_capacity(max_output_samples);
-
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // 从通道获取处理后的数据
-            while let Ok(chunk) = rx.try_recv() {
-                output_buffer.extend(chunk);
-            }
-
-            // 如果缓冲区过大，丢弃旧数据
-            while output_buffer.len() > max_output_samples {
-                output_buffer.pop_front();
-            }
-
-            // 填充输出缓冲区
-            for frame in data.chunks_mut(channels) {
-                let sample = output_buffer.pop_front().unwrap_or(0.0);
-                for ch in frame.iter_mut() {
-                    *ch = sample;
-                }
-            }
-        },
-        |err| eprintln!("输出流错误: {}", err),
-        None,
-    )?;
-
-    Ok(stream)
-}
-
-fn ctrlc_handler(running: Arc<Mutex<bool>>) {
-    ctrlc::set_handler(move || {
-        *running.lock().unwrap() = false;
-    }).unwrap();
+            cc.egui_ctx.set_fonts(fonts);
+            // 创建并返回应用实例
+            Ok(Box::new(VocalSieveApp::new()))
+        }),
+    )
 }
